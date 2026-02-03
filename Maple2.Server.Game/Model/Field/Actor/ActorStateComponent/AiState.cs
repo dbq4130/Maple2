@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using Maple2.Model.Enum;
 using Maple2.Model.Metadata;
 using Maple2.Server.Game.Packets;
@@ -429,7 +429,22 @@ public class AiState {
         Push(passed);
     }
 
-    private void ProcessNode(JumpNode node) { }
+    private void ProcessNode(JumpNode node) {
+        // Jump to a specific position
+        // For now, we'll teleport to the position since jump animation/physics isn't fully implemented
+        if (node.Pos != Vector3.Zero) {
+            actor.Position = node.Pos;
+            actor.SendControl = true;
+            actor.AppendDebugMessage($"Jump to {node.Pos}\n");
+        }
+
+        if (node.IsKeepBattle) {
+            actor.BattleState.KeepBattle = true;
+        }
+
+        // TODO: Implement proper jump physics with height multiplier and speed
+        // This would involve calculating a parabolic trajectory
+    }
 
     private void ProcessNode(SelectNode node) {
         var weightedEntries = new WeightedSet<(Entry, int)>();
@@ -464,17 +479,165 @@ public class AiState {
         SetNodeTask(task, node.Limit);
     }
 
-    private void ProcessNode(SummonNode node) { }
+    private void ProcessNode(SummonNode node) {
+        // Check current summon count
+        int currentCount = node.Group > 0
+            ? actor.Summons.Count(s => s.SummonGroup == node.Group)
+            : actor.Summons.Count;
+
+        if (currentCount >= node.NpcCountMax && node.NpcCountMax > 0) {
+            actor.AppendDebugMessage($"Summon limit reached: {currentCount}/{node.NpcCountMax}\n");
+            return;
+        }
+
+        // Get NPC metadata
+        if (!actor.Field.NpcMetadata.TryGet(node.NpcId, out NpcMetadata? npcMetadata)) {
+            Logger.Warning("SummonNode: Invalid NpcId {NpcId}", node.NpcId);
+            return;
+        }
+
+        int toSpawn = node.NpcCount;
+        if (node.NpcCountMax > 0) {
+            toSpawn = Math.Min(toSpawn, node.NpcCountMax - currentCount);
+        }
+
+        for (int i = 0; i < toSpawn; i++) {
+            // Calculate spawn position
+            Vector3 spawnPos = actor.Position;
+
+            // Apply position offset
+            if (node.SummonPosOffset != Vector3.Zero) {
+                spawnPos += node.SummonPosOffset;
+            }
+
+            // Apply fixed position if specified
+            if (node.SummonPos != Vector3.Zero) {
+                spawnPos = node.SummonPos;
+            }
+
+            // Apply random radius if specified
+            if (node.SummonRadius != Vector3.Zero) {
+                float angle = Random.Shared.NextSingle() * MathF.PI * 2;
+                spawnPos.X += MathF.Cos(angle) * node.SummonRadius.X * Random.Shared.NextSingle();
+                spawnPos.Y += MathF.Sin(angle) * node.SummonRadius.Y * Random.Shared.NextSingle();
+            }
+
+            // Apply target offset if specified and has target
+            if (node.SummonTargetOffset != Vector3.Zero && actor.BattleState.Target != null) {
+                spawnPos = actor.BattleState.Target.Position + node.SummonTargetOffset;
+            }
+
+            // Calculate rotation
+            Vector3 spawnRot = node.SummonRot != Vector3.Zero ? node.SummonRot : actor.Rotation;
+
+            // Spawn the NPC
+            FieldNpc? summon = actor.Field.SpawnNpc(npcMetadata, spawnPos, spawnRot);
+            if (summon == null) {
+                Logger.Warning("SummonNode: Failed to spawn NpcId {NpcId}", node.NpcId);
+                continue;
+            }
+
+            // Set master-slave relationship
+            summon.Master = actor;
+            summon.SummonGroup = node.Group;
+            actor.Summons.Add(summon);
+
+            // Broadcast spawn
+            actor.Field.Broadcast(FieldPacket.AddNpc(summon));
+            actor.Field.Broadcast(ProxyObjectPacket.AddNpc(summon));
+
+            actor.AppendDebugMessage($"Summoned NPC {node.NpcId} (Group: {node.Group})\n");
+
+            // Set lifetime if specified
+            if (node.LifeTime > 0) {
+                actor.Field.Scheduler.Schedule(() => {
+                    if (!summon.IsDead && actor.Summons.Contains(summon)) {
+                        actor.Field.RemoveNpc(summon.ObjectId);
+                        actor.Summons.Remove(summon);
+                    }
+                }, TimeSpan.FromMilliseconds(node.LifeTime));
+            }
+
+            // Handle summon options
+            foreach (NodeSummonOption option in node.Option) {
+                switch (option) {
+                    case NodeSummonOption.LinkHP:
+                        // TODO: Link HP between master and slave
+                        break;
+                    case NodeSummonOption.MasterHP:
+                        // Copy master's HP percentage to summon
+                        Stat masterHealth = actor.Stats.Values[BasicAttribute.Health];
+                        float hpPercent = (float) masterHealth.Current / masterHealth.Total;
+                        Stat summonHealth = summon.Stats.Values[BasicAttribute.Health];
+                        summonHealth.Current = (long) (summonHealth.Total * hpPercent);
+                        break;
+                    case NodeSummonOption.HitDamage:
+                        // TODO: Share hit damage between master and slave
+                        break;
+                }
+            }
+        }
+
+        if (node.IsKeepBattle) {
+            actor.BattleState.KeepBattle = true;
+        }
+    }
 
     private void ProcessNode(TriggerSetUserValueNode node) {
         actor.Field.UserValues[node.Key] = node.Value;
     }
 
-    private void ProcessNode(RideNode node) { }
+    private void ProcessNode(RideNode node) {
+        // TODO: Implement ride mechanics when ride system is available
+        actor.AppendDebugMessage($"RideNode: Type={node.Type}, IsRideOff={node.IsRideOff}\n");
+    }
 
-    private void ProcessNode(SetSlaveValueNode node) { }
+    private void ProcessNode(SetSlaveValueNode node) {
+        // Set a value on all summoned NPCs (slaves)
+        foreach (FieldNpc slave in actor.Summons.ToList()) {
+            if (slave.IsDead) {
+                continue;
+            }
 
-    private void ProcessNode(SetMasterValueNode node) { }
+            int valueToSet = node.Value;
+            if (node.IsRandom) {
+                valueToSet = Random.Shared.Next(0, node.Value + 1);
+            }
+
+            if (node.IsModify && slave.AiExtraData.TryGetValue(node.Key, out int oldValue)) {
+                slave.AiExtraData[node.Key] = oldValue + valueToSet;
+            } else {
+                slave.AiExtraData[node.Key] = valueToSet;
+            }
+        }
+
+        if (node.IsKeepBattle) {
+            actor.BattleState.KeepBattle = true;
+        }
+    }
+
+    private void ProcessNode(SetMasterValueNode node) {
+        // Set a value on the master NPC (if this NPC is a summon)
+        if (actor.Master == null) {
+            actor.AppendDebugMessage("SetMasterValue: No master found\n");
+            return;
+        }
+
+        int valueToSet = node.Value;
+        if (node.IsRandom) {
+            valueToSet = Random.Shared.Next(0, node.Value + 1);
+        }
+
+        if (node.IsModify && actor.Master.AiExtraData.TryGetValue(node.Key, out int oldValue)) {
+            actor.Master.AiExtraData[node.Key] = oldValue + valueToSet;
+        } else {
+            actor.Master.AiExtraData[node.Key] = valueToSet;
+        }
+
+        if (node.IsKeepBattle) {
+            actor.BattleState.KeepBattle = true;
+        }
+    }
 
     private void ProcessNode(RunawayNode node) {
         if (!actor.Field.TryGetActor(actor.BattleState.TargetId, out IActor? target)) {
@@ -582,19 +745,47 @@ public class AiState {
         actor.Field.Broadcast(NpcNoticePacket.Announce(node.Message, node.DurationTick));
     }
 
-    private void ProcessNode(ModifyRoomTimeNode node) { }
+    private void ProcessNode(ModifyRoomTimeNode node) {
+        // TODO: Implement room time modification for dungeon timers
+        actor.AppendDebugMessage($"ModifyRoomTime: {node.TimeTick}ms, ShowEffect={node.IsShowEffect}\n");
+    }
 
-    private void ProcessNode(HideVibrateAllNode node) { }
+    private void ProcessNode(HideVibrateAllNode node) {
+        // TODO: Implement vibrate effect hiding
+        if (node.IsKeepBattle) {
+            actor.BattleState.KeepBattle = true;
+        }
+    }
 
     private void ProcessNode(TriggerModifyUserValueNode node) {
         actor.Field.UserValues[node.Key] = node.Value;
     }
 
-    private void ProcessNode(RemoveSlavesNode node) { }
+    private void ProcessNode(RemoveSlavesNode node) {
+        // Remove all summoned NPCs
+        foreach (FieldNpc summon in actor.Summons.ToList()) {
+            if (!summon.IsDead) {
+                actor.Field.RemoveNpc(summon.ObjectId);
+            }
+        }
+        actor.Summons.Clear();
 
-    private void ProcessNode(CreateRandomRoomNode node) { }
+        actor.AppendDebugMessage($"RemoveSlaves: Removed all summons\n");
 
-    private void ProcessNode(CreateInteractObjectNode node) { }
+        if (node.IsKeepBattle) {
+            actor.BattleState.KeepBattle = true;
+        }
+    }
+
+    private void ProcessNode(CreateRandomRoomNode node) {
+        // TODO: Implement random room creation for dungeon mechanics
+        actor.AppendDebugMessage($"CreateRandomRoom: RoomId={node.RandomRoomId}, PortalDuration={node.PortalDuration}\n");
+    }
+
+    private void ProcessNode(CreateInteractObjectNode node) {
+        // TODO: Implement interact object creation
+        actor.AppendDebugMessage($"CreateInteractObject: InteractId={node.InteractID}, LifeTime={node.LifeTime}\n");
+    }
 
     private void ProcessNode(RemoveMeNode node) {
         actor.Field.RemoveNpc(actor.ObjectId);
@@ -616,7 +807,36 @@ public class AiState {
     }
 
     private bool ProcessCondition(CombatTimeCondition node) {
-        return false;
+        if (!actor.BattleState.InBattle || actor.CombatStartTick == 0) {
+            return false;
+        }
+
+        long combatDuration = actor.Field.FieldTick - actor.CombatStartTick;
+
+        // Check if within time window [BattleTimeBegin, BattleTimeEnd]
+        if (node.BattleTimeBegin > 0 && combatDuration < node.BattleTimeBegin) {
+            return false;
+        }
+
+        if (node.BattleTimeEnd > 0 && combatDuration > node.BattleTimeEnd) {
+            return false;
+        }
+
+        // If BattleTimeLoop is specified, check if we're at a loop interval
+        if (node.BattleTimeLoop > 0) {
+            // Calculate time since BattleTimeBegin
+            long timeInWindow = combatDuration - node.BattleTimeBegin;
+            if (timeInWindow < 0) {
+                return false;
+            }
+
+            // Check if we're at a loop boundary (within a small tolerance window)
+            long tolerance = 100; // 100ms tolerance
+            long remainder = timeInWindow % node.BattleTimeLoop;
+            return remainder < tolerance || (node.BattleTimeLoop - remainder) < tolerance;
+        }
+
+        return true;
     }
 
     private bool ProcessCondition(DistanceLessCondition node) {
@@ -663,11 +883,21 @@ public class AiState {
     }
 
     private bool ProcessCondition(SlaveCountCondition node) {
-        return false;
+        // Count summons, optionally filtered by summon group
+        int count = node.UseSummonGroup
+            ? actor.Summons.Count(s => s.SummonGroup == node.SummonGroup && !s.IsDead)
+            : actor.Summons.Count(s => !s.IsDead);
+
+        // This condition checks if the count equals the specified value
+        return count == node.Count;
     }
 
     private bool ProcessCondition(SlaveCountOpCondition node) {
-        return false;
+        // Count all active summons
+        int count = actor.Summons.Count(s => !s.IsDead);
+
+        // Use the comparison operator
+        return PerformOperation(node.SlaveCountOp, node.SlaveCount, count);
     }
 
     private bool ProcessCondition(HpOverCondition node) {

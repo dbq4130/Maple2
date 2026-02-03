@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using Maple2.Model.Enum;
 using Maple2.Server.Game.Packets;
 using static Maple2.Model.Metadata.AiMetadata;
@@ -238,6 +238,9 @@ public class BattleState {
         float nextTargetDistance = float.MaxValue;
         List<(float, IActor)>? candidates = null;
 
+        // Record combat start time when first entering combat
+        bool wasInCombat = Target != null;
+
         if (TargetType == NodeTargetType.RandAssociated || TargetType == NodeTargetType.Mid) {
             candidates = new List<(float, IActor)>();
         }
@@ -281,5 +284,10 @@ public class BattleState {
         }
 
         Target = nextTarget;
+
+        // Record combat start time when first entering combat
+        if (!wasInCombat && nextTarget != null) {
+            actor.CombatStartTick = actor.Field.FieldTick;
+        }
     }
 }
