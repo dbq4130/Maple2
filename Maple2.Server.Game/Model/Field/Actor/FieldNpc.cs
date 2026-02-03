@@ -1,4 +1,4 @@
-﻿using System.Diagnostics.CodeAnalysis;
+using System.Diagnostics.CodeAnalysis;
 using System.Numerics;
 using Maple2.Model.Enum;
 using Maple2.Model.Game;
@@ -94,6 +94,28 @@ public class FieldNpc : Actor<Npc> {
     private long idleTaskLimitTick;
 
     public readonly Dictionary<string, int> AiExtraData = new();
+
+    #region Summon System
+    /// <summary>
+    /// The master NPC that summoned this NPC (null if not a summon)
+    /// </summary>
+    public FieldNpc? Master { get; set; }
+
+    /// <summary>
+    /// List of NPCs summoned by this NPC
+    /// </summary>
+    public List<FieldNpc> Summons { get; } = new();
+
+    /// <summary>
+    /// The summon group ID for this NPC (used for SlaveCountCondition with useSummonGroup)
+    /// </summary>
+    public int SummonGroup { get; set; }
+
+    /// <summary>
+    /// Tick when combat started (used for CombatTimeCondition)
+    /// </summary>
+    public long CombatStartTick { get; set; }
+    #endregion
 
     public FieldNpc(FieldManager field, int objectId, DtCrowdAgent? agent, Npc npc, string aiPath, string spawnAnimation = "", string? patrolDataUUID = null) : base(field, objectId, npc, field.NpcMetadata) {
         IdleSequenceMetadata = npc.Animations.GetValueOrDefault("Idle_A") ?? new AnimationSequenceMetadata(string.Empty, -1, 1f, []);
@@ -318,6 +340,21 @@ public class FieldNpc : Actor<Npc> {
     protected override void OnDeath() {
         Owner?.Despawn(ObjectId);
         SendControl = false;
+
+        // Clean up summon relationships
+        // If this NPC is a summon, remove it from master's list
+        if (Master != null) {
+            Master.Summons.Remove(this);
+            Master = null;
+        }
+
+        // If this NPC has summons, remove them all
+        foreach (FieldNpc summon in Summons.ToList()) {
+            if (!summon.IsDead) {
+                Field.RemoveNpc(summon.ObjectId);
+            }
+        }
+        Summons.Clear();
 
         HandleDamageDealers();
 
